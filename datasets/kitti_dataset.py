@@ -64,9 +64,8 @@ class KITTIRAWDataset(KITTIDataset):
 
     def get_mask_path(self, folder, frame_index, side):
         f_str = "{:010d}{}".format(frame_index, self.img_ext)
-        # Assuming your masks are stored in 'yolo_instance_mask_0x' folder structure
         mask_path = os.path.join(
-            self.data_path, folder, "yolo_instance_mask_0{}".format(self.side_map[side]), "data", f_str)
+            self.data_path, folder, "mask2former_instance_mask_0{}".format(self.side_map[side]), "data", f_str)
         return mask_path
 
     def get_mask(self, folder, frame_index, side, do_flip):

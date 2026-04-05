@@ -78,14 +78,16 @@ class Trainer:
         self.models["segmentation"] = networks.DepthDecoder(self.models["encoder"].num_ch_enc,
                                                             scales=[0],
                                                             num_output_channels=9,
-                                                            is_seg=True)
+                                                            is_seg=True,
+                                                            use_aspp=True)
         self.models["segmentation"].to(self.device)
         self.parameters_to_train += list(self.models["segmentation"].parameters())
 
         self.models["centers"] = networks.DepthDecoder(self.models["encoder"].num_ch_enc,
                                                        scales=[0],
                                                        num_output_channels=1,
-                                                       is_seg=False)
+                                                       is_seg=False,
+                                                       use_aspp=True)
 
         self.models["centers"].to(self.device)
         self.parameters_to_train += list(self.models["centers"].parameters())
@@ -303,18 +305,19 @@ class Trainer:
 
             outputs = self.models["depth"](features[0])
         else:
-            # Frame 0 is standard 3-channel RGB now
+            # 1. Shared Encoder extracts raw vision
             features = self.models["encoder"](inputs["color_aug", 0, 0])
 
-            outputs = self.models["depth"](features)
-            
-            # --- Forward pass for Segmentation ---
+            # 2. Forward pass for Segmentation (With ASPP)
             seg_outputs = self.models["segmentation"](features)
             outputs["seg_mask"] = seg_outputs[("disp", 0)] 
             
-            # --- NEW: Forward pass for Object Centers ---
+            # 3. Forward pass for Centers (With ASPP)
             center_outputs = self.models["centers"](features)
-            outputs["center_heatmap"] = center_outputs[("disp", 0)] # Has Sigmoid applied!
+            outputs["center_heatmap"] = center_outputs[("disp", 0)]
+
+            semantic_hints = self.models["segmentation"].hidden_features
+            outputs = self.models["depth"](features, fusion_features=semantic_hints)
 
         if self.opt.predictive_mask:
             outputs["predictive_mask"] = self.models["predictive_mask"](features)
