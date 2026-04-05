@@ -38,7 +38,7 @@ class MonoDataset(data.Dataset):
                  frame_idxs,
                  num_scales,
                  is_train=False,
-                 img_ext='.jpg'):
+                 img_ext='.png'):
         super(MonoDataset, self).__init__()
 
         self.data_path = data_path
@@ -46,7 +46,7 @@ class MonoDataset(data.Dataset):
         self.height = height
         self.width = width
         self.num_scales = num_scales
-        self.interp = Image.ANTIALIAS
+        self.interp = Image.LANCZOS
 
         self.frame_idxs = frame_idxs
 
@@ -78,6 +78,11 @@ class MonoDataset(data.Dataset):
                                                interpolation=self.interp)
 
         self.load_depth = self.check_depth()
+
+        if self.is_train:
+            print(f"[{self.__class__.__name__}] Depth Loading is: {self.load_depth}")
+            if not self.load_depth:
+                print("WARNING: Training from scratch without Depth GT (LiDAR) is unstable!")
 
     def preprocess(self, inputs, color_aug):
         """Resize colour images to the required scales and augment if required
@@ -133,7 +138,10 @@ class MonoDataset(data.Dataset):
         do_flip = self.is_train and random.random() > 0.5
 
         line = self.filenames[index].split()
-        folder = line[0]
+        folder = line[0].strip()
+
+        if folder.startswith('\ufeff'):
+            folder = folder.replace('\ufeff', '')
 
         if len(line) == 3:
             frame_index = int(line[1])
@@ -165,10 +173,12 @@ class MonoDataset(data.Dataset):
             inputs[("inv_K", scale)] = torch.from_numpy(inv_K)
 
         if do_color_aug:
-            # color_aug = transforms.ColorJitter.get_params(
-            #     self.brightness, self.contrast, self.saturation, self.hue)
+            # This is the modern, correct way to create the augmentation
             color_aug = transforms.ColorJitter(
-                self.brightness, self.contrast, self.saturation, self.hue)
+                brightness=self.brightness,
+                contrast=self.contrast,
+                saturation=self.saturation,
+                hue=self.hue)
         else:
             color_aug = (lambda x: x)
 
@@ -197,7 +207,7 @@ class MonoDataset(data.Dataset):
         raise NotImplementedError
 
     def check_depth(self):
-        raise NotImplementedError
+        return True
 
     def get_depth(self, folder, frame_index, side, do_flip):
         raise NotImplementedError

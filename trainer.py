@@ -1,12 +1,13 @@
 from __future__ import absolute_import, division, print_function
 
-
 import time
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 
 import json
+import os
+import numpy as np
 
 from utils import *
 from kitti_utils import *
@@ -30,6 +31,12 @@ def time_sync():
 class Trainer:
     def __init__(self, options):
         self.opt = options
+
+        if len(self.opt.lr) == 1:
+            print("-> Single learning rate provided. Using it for all optimizers.")
+            main_lr = self.opt.lr[0]
+            self.opt.lr = [main_lr, 0.0, 5, main_lr, 0.0, 5]
+
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
 
         # checking height and width are multiples of 32
@@ -57,7 +64,8 @@ class Trainer:
 
         self.models["encoder"] = networks.LiteMono(model=self.opt.model,
                                                    drop_path_rate=self.opt.drop_path,
-                                                   width=self.opt.width, height=self.opt.height)
+                                                   width=self.opt.width, height=self.opt.height,
+                                                   in_chans=3)
 
         self.models["encoder"].to(self.device)
         self.parameters_to_train += list(self.models["encoder"].parameters())
@@ -66,6 +74,21 @@ class Trainer:
                                                      self.opt.scales)
         self.models["depth"].to(self.device)
         self.parameters_to_train += list(self.models["depth"].parameters())
+
+        self.models["segmentation"] = networks.DepthDecoder(self.models["encoder"].num_ch_enc,
+                                                            scales=[0],
+                                                            num_output_channels=9,
+                                                            is_seg=True)
+        self.models["segmentation"].to(self.device)
+        self.parameters_to_train += list(self.models["segmentation"].parameters())
+
+        self.models["centers"] = networks.DepthDecoder(self.models["encoder"].num_ch_enc,
+                                                       scales=[0],
+                                                       num_output_channels=1,
+                                                       is_seg=False)
+
+        self.models["centers"].to(self.device)
+        self.parameters_to_train += list(self.models["centers"].parameters())
 
         if self.use_pose_net:
             if self.opt.pose_model_type == "separate_resnet":
@@ -97,8 +120,6 @@ class Trainer:
             assert self.opt.disable_automasking, \
                 "When using predictive_mask, please disable automasking with --disable_automasking"
 
-            # Our implementation of the predictive masking baseline has the the same architecture
-            # as our depth decoder. We predict a separate mask for each source frame.
             self.models["predictive_mask"] = networks.DepthDecoder(
                 self.models["encoder"].num_ch_enc, self.opt.scales,
                 num_output_channels=(len(self.opt.frame_ids) - 1))
@@ -130,11 +151,6 @@ class Trainer:
             gamma=0.9
         )
 
-        if self.opt.load_weights_folder is not None:
-            self.load_model()
-
-        if self.opt.mypretrain is not None:
-            self.load_pretrain()
 
         print("Training model named:\n  ", self.opt.model_name)
         print("Models and tensorboard events files are saved to:\n  ", self.opt.log_dir)
@@ -149,14 +165,18 @@ class Trainer:
 
         train_filenames = readlines(fpath.format("train"))
         val_filenames = readlines(fpath.format("val"))
-        img_ext = '.png' if self.opt.png else '.jpg'
+        img_ext = '.png'
 
         num_train_samples = len(train_filenames)
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
 
+        # Note: Ensure your datasets.py logic handles 4 channels only for input frame 0
         train_dataset = self.dataset(
             self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
             self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
+            
+        train_dataset.load_depth = True
+
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, True,
             num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
@@ -269,8 +289,10 @@ class Trainer:
             inputs[key] = ipt.to(self.device)
 
         if self.opt.pose_model_type == "shared":
-            # If we are using a shared encoder for both depth and pose (as advocated
-            # in monodepthv1), then all images are fed separately through the depth encoder.
+            # NOTE: Shared model is tricky with 4 channels. 
+            # If "shared", the encoder expects 4 channels for everything.
+            # But the dataset only has 4 channels for frame 0.
+            # Recommend using "separate_resnet" for your use case.
             all_color_aug = torch.cat([inputs[("color_aug", i, 0)] for i in self.opt.frame_ids])
             all_features = self.models["encoder"](all_color_aug)
             all_features = [torch.split(f, self.opt.batch_size) for f in all_features]
@@ -281,11 +303,18 @@ class Trainer:
 
             outputs = self.models["depth"](features[0])
         else:
-            # Otherwise, we only feed the image with frame_id 0 through the depth encoder
-
+            # Frame 0 is standard 3-channel RGB now
             features = self.models["encoder"](inputs["color_aug", 0, 0])
 
             outputs = self.models["depth"](features)
+            
+            # --- Forward pass for Segmentation ---
+            seg_outputs = self.models["segmentation"](features)
+            outputs["seg_mask"] = seg_outputs[("disp", 0)] 
+            
+            # --- NEW: Forward pass for Object Centers ---
+            center_outputs = self.models["centers"](features)
+            outputs["center_heatmap"] = center_outputs[("disp", 0)] # Has Sigmoid applied!
 
         if self.opt.predictive_mask:
             outputs["predictive_mask"] = self.models["predictive_mask"](features)
@@ -310,7 +339,10 @@ class Trainer:
             if self.opt.pose_model_type == "shared":
                 pose_feats = {f_i: features[f_i] for f_i in self.opt.frame_ids}
             else:
-                pose_feats = {f_i: inputs["color_aug", f_i, 0] for f_i in self.opt.frame_ids}
+                # --- MODIFIED: Ensure we only take the first 3 channels (RGB) for pose ---
+                # Frame 0 has 4 channels, Frames -1/1 have 3 channels.
+                # Slicing [:, :3, :, :] makes them all compatible for concatenation.
+                pose_feats = {f_i: inputs["color_aug", f_i, 0][:, :3, :, :] for f_i in self.opt.frame_ids}
 
             for f_i in self.opt.frame_ids[1:]:
                 if f_i != "s":
@@ -321,6 +353,7 @@ class Trainer:
                         pose_inputs = [pose_feats[0], pose_feats[f_i]]
 
                     if self.opt.pose_model_type == "separate_resnet":
+                        # pose_inputs are now both (B, 3, H, W), so cat yields (B, 6, H, W)
                         pose_inputs = [self.models_pose["pose_encoder"](torch.cat(pose_inputs, 1))]
                     elif self.opt.pose_model_type == "posecnn":
                         pose_inputs = torch.cat(pose_inputs, 1)
@@ -336,11 +369,12 @@ class Trainer:
         else:
             # Here we input all frames to the pose net (and predict all poses) together
             if self.opt.pose_model_type in ["separate_resnet", "posecnn"]:
+                # --- MODIFIED: Ensure only RGB is concatenated ---
                 pose_inputs = torch.cat(
-                    [inputs[("color_aug", i, 0)] for i in self.opt.frame_ids if i != "s"], 1)
+                    [inputs[("color_aug", i, 0)][:, :3, :, :] for i in self.opt.frame_ids if i != "s"], 1)
 
                 if self.opt.pose_model_type == "separate_resnet":
-                    pose_inputs = [self.models["pose_encoder"](pose_inputs)]
+                    pose_inputs = [self.models_pose["pose_encoder"](pose_inputs)]
 
             elif self.opt.pose_model_type == "shared":
                 pose_inputs = [features[i] for i in self.opt.frame_ids if i != "s"]
@@ -361,10 +395,10 @@ class Trainer:
         """
         self.set_eval()
         try:
-            inputs = self.val_iter.next()
+            inputs = next(self.val_iter)
         except StopIteration:
             self.val_iter = iter(self.val_loader)
-            inputs = self.val_iter.next()
+            inputs = next(self.val_iter)
 
         with torch.no_grad():
             outputs, losses = self.process_batch(inputs)
@@ -379,7 +413,6 @@ class Trainer:
 
     def generate_images_pred(self, inputs, outputs):
         """Generate the warped (reprojected) color images for a minibatch.
-        Generated images are saved into the `outputs` dictionary.
         """
         for scale in self.opt.scales:
             disp = outputs[("disp", scale)]
@@ -401,7 +434,7 @@ class Trainer:
                 else:
                     T = outputs[("cam_T_cam", 0, frame_id)]
 
-                # from the authors of https://arxiv.org/abs/1712.00175
+                # from the authors of https://arxiv.org/abs/1712.00175 
                 if self.opt.pose_model_type == "posecnn":
 
                     axisangle = outputs[("axisangle", 0, frame_id)]
@@ -443,6 +476,45 @@ class Trainer:
 
         return reprojection_loss
 
+    def create_center_heatmap(self, panoptic_mask):
+        """ Converts a 16-bit panoptic mask into a glowing center heatmap for Instance Segmentation """
+        B, H, W = panoptic_mask.shape
+        heatmap = torch.zeros((B, 1, H, W), device=self.device, dtype=torch.float32)
+        
+        # Create a grid of X and Y coordinates
+        y_grid = torch.arange(H, device=self.device).view(-1, 1).repeat(1, W)
+        x_grid = torch.arange(W, device=self.device).view(1, -1).repeat(H, 1)
+        sigma = 8.0 # The size/softness of the glowing dot
+        
+        for b in range(B):
+            inst_map = panoptic_mask[b]
+            unique_instances = torch.unique(inst_map)
+            
+            for inst_id in unique_instances:
+                if inst_id < 1000: # Skip the background (0)
+                    continue
+                
+                # Get the mask for just this specific car/person
+                mask = (inst_map == inst_id)
+                if mask.sum() == 0:
+                    continue
+                    
+                # Find the center of mass
+                y_coords = torch.masked_select(y_grid, mask).float()
+                x_coords = torch.masked_select(x_grid, mask).float()
+                
+                center_y = y_coords.mean()
+                center_x = x_coords.mean()
+                
+                # Draw a Gaussian glow around the center
+                dist_sq = (x_grid - center_x)**2 + (y_grid - center_y)**2
+                gaussian = torch.exp(-dist_sq / (2 * sigma**2))
+                
+                # Use max to blend it into the main heatmap (prevents overlapping centers from erasing each other)
+                heatmap[b, 0] = torch.max(heatmap[b, 0], gaussian)
+                
+        return heatmap
+
     def compute_losses(self, inputs, outputs):
         """Compute the reprojection and smoothness losses for a minibatch
         """
@@ -468,6 +540,36 @@ class Trainer:
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
 
             reprojection_losses = torch.cat(reprojection_losses, 1)
+
+            if "depth_gt" in inputs:
+                depth_gt = inputs["depth_gt"]
+                
+                depth_pred = outputs[("depth", 0, scale)]
+                depth_pred = F.interpolate(depth_pred, [375, 1242], mode="bilinear", align_corners=False)
+                
+                mask = (depth_gt > 0) & (depth_gt < 80.0)
+                
+                if mask.sum() > 0:
+                    # --- THE NEW ADVICE IMPLEMENTED ---
+                    
+                    # 1. Put both the Prediction and Ground Truth into Log-Space
+                    # This scales the data so 1m and 50m are treated fairly by the optimizer
+                    log_pred = torch.log(depth_pred[mask])
+                    log_gt = torch.log(depth_gt[mask])
+                    
+                    # 2. Huber Loss (Smooth L1 Loss)
+                    # Huber acts like L2 (Mean Squared) for small errors, and L1 (Absolute) for large errors.
+                    # It is perfectly robust to noisy/outlier LiDAR points.
+                    metric_loss = F.huber_loss(log_pred, log_gt, delta=0.2)
+                    
+                    # 3. Add it to the total loss. 
+                    # Weighting it at 1.0 or 2.0 forces the model to prioritize real-world scale
+                    loss += 1.0 * metric_loss
+                
+            if mask.sum() > 0:
+                l1_metric_loss = torch.abs(depth_pred[mask] - depth_gt[mask]).mean()
+                    
+                loss += 1.0 * l1_metric_loss
 
             if not self.opt.disable_automasking:
                 identity_reprojection_losses = []
@@ -532,14 +634,37 @@ class Trainer:
             losses["loss/{}".format(scale)] = loss
 
         total_loss /= self.num_scales
+        # --- MULTI-TASK LEARNING LOSSES ---
+        if "seg_gt" in inputs:
+            # 1. The Raw 16-bit Panoptic Mask
+            panoptic_gt = inputs["seg_gt"] 
+            
+            # 2. Extract Semantic GT (e.g. 3002 // 1000 = 3)
+            semantic_gt = (panoptic_gt // 1000).long()
+            
+            # 3. Generate Center Heatmap GT
+            center_gt = self.create_center_heatmap(panoptic_gt)
+            
+            # --- Loss 1: Semantic (CrossEntropy) ---
+            seg_pred = outputs["seg_mask"]
+            class_weights = torch.tensor([0.1, 10.0, 10.0, 5.0, 10.0, 5.0, 5.0, 10.0, 10.0], device=self.device)
+            seg_loss = torch.nn.CrossEntropyLoss(weight=class_weights)(seg_pred, semantic_gt)
+            
+            # --- Loss 2: Center Heatmap (Mean Squared Error) ---
+            center_pred = outputs["center_heatmap"]
+            center_loss = torch.nn.MSELoss()(center_pred, center_gt)
+            
+            # Combine all 3 tasks! (Depth + Semantic + Centers)
+            total_loss += (0.5 * seg_loss) + (1.0 * center_loss)
+            
+            losses["seg_loss"] = seg_loss
+            losses["center_loss"] = center_loss
+
         losses["loss"] = total_loss
         return losses
 
     def compute_depth_losses(self, inputs, outputs, losses):
         """Compute depth metrics, to allow monitoring during training
-
-        This isn't particularly accurate as it averages over the entire batch,
-        so is only used to give an indication of validation performance
         """
         depth_pred = outputs[("depth", 0, 0)]
         depth_pred = torch.clamp(F.interpolate(
@@ -556,9 +681,10 @@ class Trainer:
 
         depth_gt = depth_gt[mask]
         depth_pred = depth_pred[mask]
-        depth_pred *= torch.median(depth_gt) / torch.median(depth_pred)
+        # depth_pred *= torch.median(depth_gt) / torch.median(depth_pred)
 
-        depth_pred = torch.clamp(depth_pred, min=1e-3, max=80)
+        # depth_pred = torch.clamp(depth_pred, min=1e-3, max=80)
+        depth_pred = torch.clamp(depth_pred, min=0.1, max=80)
 
         depth_errors = compute_depth_errors(depth_gt, depth_pred)
 
@@ -600,6 +726,31 @@ class Trainer:
                 writer.add_image(
                     "disp_{}/{}".format(s, j),
                     normalize_image(outputs[("disp", s)][j]), self.step)
+
+# --- NEW: Log Segmentation Masks to Tensorboard ---
+            if "seg_mask" in outputs:
+                # 1. Handle Predictions
+                pred_tensor = outputs["seg_mask"][j].data
+                if pred_tensor.shape[0] > 1:
+                    # Multi-Class (9 channels): Squash to 1 channel via Argmax
+                    # Divide by 8.0 so classes 0-8 scale between 0.0 (black) and 1.0 (white)
+                    pred_tensor = torch.argmax(pred_tensor, dim=0, keepdim=True).float() / 8.0
+                
+                writer.add_image("segmentation_pred/{}".format(j), pred_tensor, self.step)
+                
+                # 2. Handle Ground Truth
+                gt_tensor = inputs["seg_gt"][j].data
+                if gt_tensor.dim() == 2:
+                    gt_tensor = gt_tensor.unsqueeze(0) # Ensure it has a channel dim: (1, H, W)
+                
+                if gt_tensor.max() > 1.5: 
+                    # Multi-class IDs (1-8)
+                    gt_tensor = gt_tensor.float() / 8.0
+                else:
+                    # Binary IDs (0 or 1)
+                    gt_tensor = gt_tensor.float()
+                    
+                writer.add_image("segmentation_gt/{}".format(j), gt_tensor, self.step)
 
                 if self.opt.predictive_mask:
                     for f_idx, frame_id in enumerate(self.opt.frame_ids[1:]):
@@ -653,15 +804,44 @@ class Trainer:
         if self.use_pose_net:
             torch.save(self.model_pose_optimizer.state_dict(), save_path)
 
+    # --- MODIFIED: Robust weight loading for 4 channels ---
     def load_pretrain(self):
         self.opt.mypretrain = os.path.expanduser(self.opt.mypretrain)
         path = self.opt.mypretrain
+        
+        print(f"Loading pretrained weights from {path}...")
+        try:
+            pretrained_dict = torch.load(path, map_location=self.device)
+        except FileNotFoundError:
+            print(f"Error: Pretrained model not found at {path}")
+            return
+
+        if 'model' in pretrained_dict:
+            pretrained_dict = pretrained_dict['model']
+
         model_dict = self.models["encoder"].state_dict()
-        pretrained_dict = torch.load(path)['model']
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() if (k in model_dict and not k.startswith('norm'))}
-        model_dict.update(pretrained_dict)
-        self.models["encoder"].load_state_dict(model_dict)
-        print('mypretrain loaded.')
+        
+        # New state dict to store adapted weights
+        new_state_dict = {}
+        
+        for k, v in pretrained_dict.items():
+            if k in model_dict:
+                # Check for shape mismatch (specifically for the first conv layer)
+                if v.shape != model_dict[k].shape:
+                    if v.shape[1] == 3 and model_dict[k].shape[1] == 4:
+                        print(f"Adapting layer {k} from 3 channels to 4 channels.")
+                        # Initialize mask channel weights to ZERO to maintain stability
+                        zeros = torch.zeros(v.shape[0], 1, v.shape[2], v.shape[3]).to(self.device)
+                        new_weight = torch.cat((v, zeros), dim=1)
+                        new_state_dict[k] = new_weight
+                    else:
+                        print(f"Skipping {k} due to incompatible shape mismatch: {v.shape} vs {model_dict[k].shape}")
+                else:
+                    new_state_dict[k] = v
+        
+        # Load the adapted weights
+        self.models["encoder"].load_state_dict(new_state_dict, strict=False)
+        print("Pretrained weights loaded successfully.")
 
     def load_model(self):
         """Load model(s) from disk
@@ -690,7 +870,6 @@ class Trainer:
                 self.models[n].load_state_dict(model_dict)
 
         # loading adam state
-
         optimizer_load_path = os.path.join(self.opt.load_weights_folder, "adam.pth")
         optimizer_pose_load_path = os.path.join(self.opt.load_weights_folder, "adam_pose.pth")
         if os.path.isfile(optimizer_load_path):
@@ -701,4 +880,3 @@ class Trainer:
             self.model_pose_optimizer.load_state_dict(optimizer_pose_dict)
         else:
             print("Cannot find Adam weights so Adam is randomly initialized")
-

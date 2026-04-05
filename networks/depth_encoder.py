@@ -349,7 +349,7 @@ class LiteMono(nn.Module):
         )
 
         self.stem2 = nn.Sequential(
-            Conv(self.dims[0]+3, self.dims[0], kSize=3, stride=2, padding=1, bn_act=False),
+            Conv(self.dims[0] + in_chans, self.dims[0], kSize=3, stride=2, padding=1, bn_act=False),
         )
 
         self.downsample_layers.append(stem1)
@@ -360,7 +360,7 @@ class LiteMono(nn.Module):
 
         for i in range(2):
             downsample_layer = nn.Sequential(
-                Conv(self.dims[i]*2+3, self.dims[i+1], kSize=3, stride=2, padding=1, bn_act=False),
+                Conv(self.dims[i] * 2 + in_chans, self.dims[i + 1], kSize=3, stride=2, padding=1, bn_act=False),
             )
             self.downsample_layers.append(downsample_layer)
 

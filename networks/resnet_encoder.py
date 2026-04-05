@@ -4,7 +4,9 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 import torch.utils.model_zoo as model_zoo
+from torch.hub import load_state_dict_from_url
 from torchvision import transforms
+from torchvision.models import ResNet18_Weights, ResNet50_Weights
 
 
 class ResNetMultiImageInput(models.ResNet):
@@ -32,12 +34,9 @@ class ResNetMultiImageInput(models.ResNet):
                 nn.init.constant_(m.bias, 0)
 
 
-def resnet_multiimage_input(num_layers, pretrained=False, num_input_images=1):
-    """Constructs a ResNet model.
-    Args:
-        num_layers (int): Number of resnet layers. Must be 18 or 50
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        num_input_images (int): Number of frames stacked as input
+def resnet_multiimage_input(num_layers, pretrained, num_input_images):
+    """Constructs a resnet model with varying number of input images.
+    Adapted from https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py
     """
     assert num_layers in [18, 50], "Can only run with 18 or 50 layer resnet"
     blocks = {18: [2, 2, 2, 2], 50: [3, 4, 6, 3]}[num_layers]
@@ -45,10 +44,25 @@ def resnet_multiimage_input(num_layers, pretrained=False, num_input_images=1):
     model = ResNetMultiImageInput(block_type, blocks, num_input_images=num_input_images)
 
     if pretrained:
-        loaded = model_zoo.load_url(models.resnet.model_urls['resnet{}'.format(num_layers)])
+        # --- START OF MODIFICATION ---
+        # Use the new weights API instead of the deprecated model_urls
+        print(f"Loading pretrained weights for ResNet{num_layers}")
+
+        # Map layer number to the new weights enum
+        weights_mapping = {
+            18: ResNet18_Weights.DEFAULT,  # DEFAULT = IMAGENET1K_V1
+            50: ResNet50_Weights.DEFAULT,
+        }
+        weights = weights_mapping[num_layers]
+
+        # Load state dict from the URL provided by the new API
+        loaded = load_state_dict_from_url(weights.url)
+        # --- END OF MODIFICATION ---
+
         loaded['conv1.weight'] = torch.cat(
             [loaded['conv1.weight']] * num_input_images, 1) / num_input_images
         model.load_state_dict(loaded)
+
     return model
 
 

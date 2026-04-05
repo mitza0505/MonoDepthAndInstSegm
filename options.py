@@ -28,8 +28,7 @@ class LiteMonoOptions:
         self.parser.add_argument("--split",
                                  type=str,
                                  help="which training split to use",
-                                 choices=["eigen_zhou", "eigen_full", "odom", "benchmark"],
-                                 default="eigen_zhou")
+                                 choices=["eigen_zhou", "eigen_full", "odom", "benchmark", "eigen_zhou_mini",  "eigen_zhou_filtered"])
         self.parser.add_argument("--model",
                                  type=str,
                                  help="which model to load",

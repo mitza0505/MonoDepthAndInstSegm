@@ -5,13 +5,14 @@ from timm.models.layers import trunc_normal_
 
 
 class DepthDecoder(nn.Module):
-    def __init__(self, num_ch_enc, scales=range(4), num_output_channels=1, use_skips=True):
+    def __init__(self, num_ch_enc, scales=range(4), num_output_channels=1, use_skips=True, is_seg=False):
         super().__init__()
 
         self.num_output_channels = num_output_channels
         self.use_skips = use_skips
         self.upsample_mode = 'bilinear'
         self.scales = scales
+        self.is_seg = is_seg
 
         self.num_ch_enc = num_ch_enc
         self.num_ch_dec = (self.num_ch_enc / 2).astype('int')
@@ -60,6 +61,11 @@ class DepthDecoder(nn.Module):
             if i in self.scales:
                 f = upsample(self.convs[("dispconv", i)](x), mode='bilinear')
                 self.outputs[("disp", i)] = self.sigmoid(f)
+
+                if self.is_seg:
+                    self.outputs[("disp", i)] = f
+                else:
+                    self.outputs[("disp", i)] = self.sigmoid(f)
 
         return self.outputs
 
