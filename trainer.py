@@ -304,20 +304,26 @@ class Trainer:
                 features[k] = [f[i] for f in all_features]
 
             outputs = self.models["depth"](features[0])
+            outputs["seg_mask"] = torch.zeros_like(outputs[("disp", 0)])
+            outputs["center_heatmap"] = torch.zeros_like(outputs[("disp", 0)])
         else:
-            # 1. Shared Encoder extracts raw vision
+            # Frame 0 is standard 3-channel RGB
             features = self.models["encoder"](inputs["color_aug", 0, 0])
 
-            # 2. Forward pass for Segmentation (With ASPP)
+            # Depth Decoder (using our Cross-Task Fusion)
+            # We run segmentation first to get the fusion hints
             seg_outputs = self.models["segmentation"](features)
-            outputs["seg_mask"] = seg_outputs[("disp", 0)] 
-            
-            # 3. Forward pass for Centers (With ASPP)
             center_outputs = self.models["centers"](features)
+            
+            # Fusion hints: The segmentation decoder's hidden features
+            fusion_hints = self.models["segmentation"].hidden_features
+            
+            # Depth Decoder now consumes those hints
+            outputs = self.models["depth"](features, fusion_features=fusion_hints)
+            
+            # Add Seg and Center results to the main outputs dict
+            outputs["seg_mask"] = seg_outputs[("disp", 0)] 
             outputs["center_heatmap"] = center_outputs[("disp", 0)]
-
-            semantic_hints = self.models["segmentation"].hidden_features
-            outputs = self.models["depth"](features, fusion_features=semantic_hints)
 
         if self.opt.predictive_mask:
             outputs["predictive_mask"] = self.models["predictive_mask"](features)

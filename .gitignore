@@ -1,0 +1,14 @@
+tmp/*
+__pycache__/**
+__pycache__/kitti_utils.cpython-312.pyc
+__pycache__/options.cpython-312.pyc
+__pycache__/trainer.cpython-312.pyc
+__pycache__/utils.cpython-312.pyc
+datasets/__pycache__/__init__.cpython-312.pyc
+datasets/__pycache__/kitti_dataset.cpython-312.pyc
+datasets/__pycache__/mono_dataset.cpython-312.pyc
+networks/__pycache__/__init__.cpython-312.pyc
+networks/__pycache__/depth_decoder.cpython-312.pyc
+networks/__pycache__/depth_encoder.cpython-312.pyc
+networks/__pycache__/pose_decoder.cpython-312.pyc
+networks/__pycache__/resnet_encoder.cpython-312.pyc
