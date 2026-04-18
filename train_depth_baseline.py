@@ -423,7 +423,11 @@ class DepthOnlyTrainer:
             if combined.shape[1] == 1:
                 to_optimise = combined
             else:
-                to_optimise, _ = torch.min(combined, dim=1)
+                to_optimise, idxs = torch.min(combined, dim=1)
+
+            if not self.opt.disable_automasking:
+                outputs["identity_selection/{}".format(scale)] = (
+                    idxs > identity_reprojection_loss.shape[1] - 1).float()
 
             loss += to_optimise.mean()
 
@@ -459,7 +463,7 @@ class DepthOnlyTrainer:
         depth_errors = compute_depth_errors(depth_gt, depth_pred)
 
         for i, metric in enumerate(self.depth_metric_names):
-            losses[metric] = np.array(depth_errors[i].cpu())
+            losses[metric] = depth_errors[i].cpu().item()
 
     def val(self):
         self.set_eval()
