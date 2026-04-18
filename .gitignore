@@ -1,4 +1,7 @@
 tmp/*
+article/*
+.openclaude/*
+.claude/*
 __pycache__/**
 __pycache__/kitti_utils.cpython-312.pyc
 __pycache__/options.cpython-312.pyc
