@@ -65,13 +65,17 @@ For fair comparison with Monodepth2 and Lite-Mono:
 ```bash
 python train_depth_baseline.py \
     --model_name depth_baseline \
-    --data_path ./kitti_data \
-    --split eigen_zhou \
+    --data_path /mnt/hdd2/home/mihaitalupascu/kitti/kitti_data/ \
+    --split eigen_zhou_filtered \
     --model lite-mono-8m \
     --height 192 \
     --width 640 \
     --batch_size 12 \
-    --num_epochs 50
+    --num_epochs 20 \
+    --lr 1e-4 \
+    --num_workers 4 \
+    --min_depth 0.1 \
+    --max_depth 80.0
 ```
 
 **Outputs:**

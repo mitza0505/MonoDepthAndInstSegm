@@ -207,6 +207,11 @@ class DepthOnlyTrainer:
 
         self.save_opts()
 
+        print(f"DEBUG: load_weights_folder is: {self.opt.load_weights_folder}")
+
+        if self.opt.load_weights_folder is not None:
+            self.load_model()
+
     def set_train(self):
         for m in self.models.values():
             m.train()
@@ -551,6 +556,44 @@ class DepthOnlyTrainer:
 
         if self.use_pose_net:
             torch.save(self.model_pose_optimizer.state_dict(), os.path.join(save_folder, "adam_pose.pth"))
+
+    def load_model(self):
+        """Load model(s) from disk
+        """
+        self.opt.load_weights_folder = os.path.expanduser(self.opt.load_weights_folder)
+
+        assert os.path.isdir(self.opt.load_weights_folder), \
+            "Cannot find folder {}".format(self.opt.load_weights_folder)
+        print("loading model from folder {}".format(self.opt.load_weights_folder))
+
+        for n in self.opt.models_to_load:
+            print("Loading {} weights...".format(n))
+            path = os.path.join(self.opt.load_weights_folder, "{}.pth".format(n))
+
+            if n in ['pose_encoder', 'pose']:
+                model_dict = self.models_pose[n].state_dict()
+                pretrained_dict = torch.load(path)
+                pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+                model_dict.update(pretrained_dict)
+                self.models_pose[n].load_state_dict(model_dict)
+            else:
+                model_dict = self.models[n].state_dict()
+                pretrained_dict = torch.load(path)
+                pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+                model_dict.update(pretrained_dict)
+                self.models[n].load_state_dict(model_dict)
+
+        # loading adam state
+        optimizer_load_path = os.path.join(self.opt.load_weights_folder, "adam.pth")
+        optimizer_pose_load_path = os.path.join(self.opt.load_weights_folder, "adam_pose.pth")
+        if os.path.isfile(optimizer_load_path):
+            print("Loading Adam weights")
+            optimizer_dict = torch.load(optimizer_load_path)
+            optimizer_pose_dict = torch.load(optimizer_pose_load_path)
+            self.model_optimizer.load_state_dict(optimizer_dict)
+            self.model_pose_optimizer.load_state_dict(optimizer_pose_dict)
+        else:
+            print("Cannot find Adam weights so Adam is randomly initialized")
 
 
 def train_depth_baseline(options):

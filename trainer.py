@@ -219,6 +219,11 @@ class Trainer:
 
         self.save_opts()
 
+        print(f"DEBUG: load_weights_folder is: {self.opt.load_weights_folder}")
+
+        if self.opt.load_weights_folder is not None:
+            self.load_model()
+
     def set_train(self):
         """Convert all models to training mode
         """
