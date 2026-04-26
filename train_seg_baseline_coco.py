@@ -2,7 +2,6 @@
 """
 Training script for single-task segmentation baseline on COCO.
 Trains only the segmentation head for fair comparison with published methods.
-Uses COCO panoptic annotations (real ground truth, not pseudo-labels).
 """
 
 from __future__ import absolute_import, division, print_function
@@ -24,6 +23,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import networks
 
+# Import the new dataset
+from coco_dataset import COCOSegmentationDataset
+
+
+def time_sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.time()
+
 
 class SegOnlyTrainer:
     """Trainer for single-task segmentation on COCO."""
@@ -37,13 +45,11 @@ class SegOnlyTrainer:
         assert self.opt.width % 32 == 0, "'width' must be a multiple of 32"
 
         self.models = {}
-        self.parameters_to_train = []
+        self.parameters_to_train =[]
 
         self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
 
-        # COCO has 133 classes (80 thing + 53 stuff) for panoptic
-        # or 80 classes for instance, or 133 for semantic
-        self.num_classes = options.num_classes  # 133 for COCO panoptic
+        self.num_classes = options.num_classes
 
         # SEGMENTATION-ONLY: Encoder + Segmentation decoder only
         self.models["encoder"] = networks.LiteMono(
@@ -56,18 +62,15 @@ class SegOnlyTrainer:
         self.models["encoder"].to(self.device)
         self.parameters_to_train += list(self.models["encoder"].parameters())
 
-        # Segmentation decoder with ASPP
         self.models["segmentation"] = networks.DepthDecoder(
             self.models["encoder"].num_ch_enc,
             scales=[0],
             num_output_channels=self.num_classes,
             is_seg=True,
-            use_aspp=True
+            use_aspp=self.opt.use_aspp
         )
         self.models["segmentation"].to(self.device)
         self.parameters_to_train += list(self.models["segmentation"].parameters())
-
-        # NO depth decoder, NO centers decoder for seg-only baseline
 
         self.model_optimizer = optim.AdamW(
             self.parameters_to_train,
@@ -87,9 +90,35 @@ class SegOnlyTrainer:
         print("Device:", self.device)
         print("Number of classes:", self.num_classes)
 
-        # Load COCO dataset
-        # Note: You need to implement COCOSegmentationDataset or use pycocotools
-        # This is a placeholder structure
+        # ----------------------------------------------------
+        # DATA LOADING (Mirrors train_depth_baseline.py)
+        # ----------------------------------------------------
+        fpath = os.path.join(os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt")
+        train_filenames = readlines(fpath.format("train"))
+        val_filenames = readlines(fpath.format("val"))
+
+        num_train_samples = len(train_filenames)
+        self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
+
+        train_dataset = COCOSegmentationDataset(
+            self.opt.data_path, train_filenames, self.opt.height, self.opt.width, is_train=True)
+
+        self.train_loader = DataLoader(
+            train_dataset, self.opt.batch_size, True,
+            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+
+        val_dataset = COCOSegmentationDataset(
+            self.opt.data_path, val_filenames, self.opt.height, self.opt.width, is_train=False)
+
+        self.val_loader = DataLoader(
+            val_dataset, self.opt.batch_size, True,
+            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+        
+        self.val_iter = iter(self.val_loader)
+
+        print("Using split:\n  ", self.opt.split)
+        print("There are {:d} training items and {:d} validation items\n".format(
+            len(train_dataset), len(val_dataset)))
 
         self.writers = {}
         for mode in ["train", "val"]:
@@ -114,6 +143,9 @@ class SegOnlyTrainer:
             self.run_epoch()
             if (self.epoch + 1) % self.opt.save_frequency == 0:
                 self.save_model()
+            
+            # Full validation run at the end of every epoch for real mIoU
+            self.val_epoch()
 
     def run_epoch(self):
         print("Training epoch", self.epoch)
@@ -121,34 +153,37 @@ class SegOnlyTrainer:
         self.model_lr_scheduler.step()
 
         for batch_idx, inputs in enumerate(self.train_loader):
+            before_op_time = time.time()
+
             outputs, losses = self.process_batch(inputs)
 
             self.model_optimizer.zero_grad()
             losses["loss"].backward()
             self.model_optimizer.step()
 
-            if batch_idx % self.opt.log_frequency == 0:
-                print(f"Epoch {self.epoch}, Batch {batch_idx}, Loss: {losses['loss'].item():.4f}")
+            duration = time.time() - before_op_time
+
+            # Log frequently matching the depth baseline frequency
+            early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 20000
+            late_phase = self.step % 2000 == 0
+
+            if early_phase or late_phase:
+                self.log_time(batch_idx, duration, losses["loss"].cpu().data)
                 self.log("train", inputs, outputs, losses)
+                self.val() # Quick single-batch validation to populate TensorBoard
 
             self.step += 1
-
-        # Validation
-        self.validate()
 
     def process_batch(self, inputs):
         """Process a batch for segmentation training."""
         images = inputs["image"].to(self.device)  # (B, 3, H, W)
-        labels = inputs["label"].to(self.device)  # (B, H, W) - class indices
+        labels = inputs["label"].to(self.device)  # (B, H, W)
 
-        # Forward pass
         features = self.models["encoder"](images)
         seg_outputs = self.models["segmentation"](features)
 
-        # Get logits at full resolution
         seg_logits = seg_outputs[("disp", 0)]  # (B, num_classes, H, W)
 
-        # Upsample if needed to match label size
         if seg_logits.shape[2:] != labels.shape[1:]:
             seg_logits = F.interpolate(
                 seg_logits,
@@ -157,8 +192,6 @@ class SegOnlyTrainer:
                 align_corners=False
             )
 
-        # Compute loss
-        # Cross-entropy loss for segmentation
         loss = F.cross_entropy(seg_logits, labels, ignore_index=255)
 
         outputs = {
@@ -170,35 +203,46 @@ class SegOnlyTrainer:
 
         return outputs, losses
 
-    def validate(self):
-        """Run validation."""
+    def val(self):
+        """Single batch validation logging logic mimicking train_depth_baseline.py"""
+        self.set_eval()
+        try:
+            inputs = next(self.val_iter)
+        except StopIteration:
+            self.val_iter = iter(self.val_loader)
+            inputs = next(self.val_iter)
+
+        with torch.no_grad():
+            outputs, losses = self.process_batch(inputs)
+            self.log("val", inputs, outputs, losses)
+            del inputs, outputs, losses
+
+        self.set_train()
+
+    def val_epoch(self):
+        """Run full epoch validation for mIoU calculation."""
         self.set_eval()
 
         total_loss = 0
         total_miou = 0
         num_batches = 0
 
+        print(f"Running full validation for epoch {self.epoch}...")
         with torch.no_grad():
             for inputs in self.val_loader:
                 outputs, losses = self.process_batch(inputs)
-
                 total_loss += losses["loss"].item()
 
-                # Compute mIoU
                 pred = outputs["seg_pred"].cpu().numpy()
                 label = inputs["label"].cpu().numpy()
 
-                # Calculate IoU per class
-                ious = []
+                ious =[]
                 for cls in range(self.num_classes):
-                    if cls == 255:  # ignore index
-                        continue
+                    if cls == 255: continue
                     pred_mask = (pred == cls)
                     label_mask = (label == cls)
-
                     intersection = (pred_mask & label_mask).sum()
                     union = (pred_mask | label_mask).sum()
-
                     if union > 0:
                         ious.append(intersection / union)
 
@@ -209,32 +253,59 @@ class SegOnlyTrainer:
         avg_loss = total_loss / num_batches
         avg_miou = total_miou / num_batches
 
-        print(f"Validation - Loss: {avg_loss:.4f}, mIoU: {avg_miou:.4f}")
+        print(f"Epoch {self.epoch} Validation - Loss: {avg_loss:.4f}, mIoU: {avg_miou:.4f}")
 
-        # Log to tensorboard
-        self.writers["val"].add_scalar("loss", avg_loss, self.epoch)
-        self.writers["val"].add_scalar("miou", avg_miou, self.epoch)
+        # Log Epoch metrics to tensorboard
+        self.writers["val"].add_scalar("epoch/loss", avg_loss, self.epoch)
+        self.writers["val"].add_scalar("epoch/miou", avg_miou, self.epoch)
 
         self.set_train()
 
     def log(self, mode, inputs, outputs, losses):
-        """Log to tensorboard."""
+        """Log scalars and images to tensorboard."""
         writer = self.writers[mode]
         for l, v in losses.items():
             writer.add_scalar(l, v, self.step)
 
+        # Log a few images per batch
+        for j in range(min(4, self.opt.batch_size)):
+            # Original RGB Image
+            writer.add_image(f"image/{j}", inputs["image"][j].data, self.step)
+
+            # Ground Truth Mask
+            gt_tensor = inputs["label"][j].unsqueeze(0).float()
+            # Ignore 255 indexing by masking it for visualization
+            gt_tensor[gt_tensor == 255] = 0 
+            # Scale to [0, 1] based on number of classes for bright visual feedback
+            gt_visual = gt_tensor / float(self.num_classes)
+            writer.add_image(f"gt_mask/{j}", gt_visual, self.step)
+
+            # Predicted Mask
+            pred_tensor = outputs["seg_pred"][j].unsqueeze(0).float()
+            pred_visual = pred_tensor / float(self.num_classes)
+            writer.add_image(f"pred_mask/{j}", pred_visual, self.step)
+
+    def log_time(self, batch_idx, duration, loss):
+        """Print a logging statement to the terminal"""
+        samples_per_sec = self.opt.batch_size / duration
+        time_sofar = time.time() - self.start_time
+        training_time_left = (self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
+        
+        print_string = "epoch {:>3} | lr {:.6f} | batch {:>6} | examples/s: {:5.1f} | loss: {:.5f} | time elapsed: {} | time left: {}"
+        print(print_string.format(
+            self.epoch, self.model_optimizer.state_dict()['param_groups'][0]['lr'],
+            batch_idx, samples_per_sec, loss,
+            sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
+
     def save_opts(self):
-        """Save options."""
         models_dir = os.path.join(self.log_path, "models")
         if not os.path.exists(models_dir):
             os.makedirs(models_dir)
         to_save = self.opt.__dict__.copy()
-
         with open(os.path.join(models_dir, 'opt.json'), 'w') as f:
             json.dump(to_save, f, indent=2)
 
     def save_model(self):
-        """Save model weights."""
         save_folder = os.path.join(self.log_path, "models", "weights_{}".format(self.epoch))
         if not os.path.exists(save_folder):
             os.makedirs(save_folder)
@@ -246,25 +317,23 @@ class SegOnlyTrainer:
                 to_save['height'] = self.opt.height
                 to_save['width'] = self.opt.width
             torch.save(to_save, save_path)
-
         print(f"Saved model to {save_folder}")
 
 
 class SegmentationOptions:
-    """Options for segmentation training."""
-
     def __init__(self):
-        # Paths
         self.data_path = "./coco"
         self.log_dir = "./tmp"
         self.model_name = "seg_baseline"
+        
+        # Ensures that your code reads `splits/coco/train_files.txt`
+        self.split = "coco"
+        self.dataset = "coco"
 
-        # Model
-        self.model = "lite-mono-8m"  # or lite-mono, lite-mono-small, etc.
-        self.num_classes = 133  # COCO panoptic has 133 classes
+        self.model = "lite-mono-8m"
+        self.num_classes = 133 
         self.use_aspp = True
 
-        # Training
         self.height = 640
         self.width = 640
         self.batch_size = 16
@@ -274,30 +343,19 @@ class SegmentationOptions:
         self.drop_path = 0.1
         self.scheduler_step_size = 30
 
-        # Logging
         self.log_frequency = 100
         self.save_frequency = 5
-
-        # System
         self.no_cuda = False
         self.num_workers = 8
 
-        # Dataset
-        self.dataset = "coco"  # or "cityscapes"
-
-
 def train_seg_baseline():
-    """Main training function."""
     options = SegmentationOptions()
-
-    # Parse command line args if needed
     import sys
     if len(sys.argv) > 1:
         options.model_name = sys.argv[1]
 
     trainer = SegOnlyTrainer(options)
     trainer.train()
-
 
 if __name__ == "__main__":
     train_seg_baseline()
