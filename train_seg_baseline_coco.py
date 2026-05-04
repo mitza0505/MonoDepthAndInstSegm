@@ -1,361 +1,300 @@
 #!/usr/bin/env python
 """
-Training script for single-task segmentation baseline on COCO.
-Trains only the segmentation head for fair comparison with published methods.
+Benchmark segmentation on COCO or Cityscapes for comparison with published results.
+Evaluates PQ (Panoptic Quality), mIoU, and AP metrics.
+
+Usage:
+    python benchmark_seg_coco.py --load_weights_folder /path/to/weights --dataset coco
 """
 
 from __future__ import absolute_import, division, print_function
 
-import time
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from tensorboardX import SummaryWriter
-
-import json
 import os
+import argparse
 import numpy as np
-
-from utils import *
-from layers import *
+import json
+from collections import defaultdict
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import networks
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from PIL import Image
 
-# Import the new dataset
+import networks
+# Import your dataset class
 from coco_dataset import COCOSegmentationDataset
 
 
-def time_sync():
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    return time.time()
+def parse_args():
+    parser = argparse.ArgumentParser(description='Benchmark segmentation on COCO/Cityscapes')
+    parser.add_argument('--load_weights_folder', type=str, required=True,
+                        help='path to trained segmentation model')
+    parser.add_argument('--model', type=str, default='lite-mono-8m',
+                        choices=['lite-mono', 'lite-mono-small', 'lite-mono-tiny', 'lite-mono-8m'])
+    parser.add_argument('--dataset', type=str, default='coco',
+                        choices=['coco', 'cityscapes', 'kitti'])
+    parser.add_argument('--data_path', type=str, default='./coco',
+                        help='path to dataset')
+    parser.add_argument('--split', type=str, default='val',
+                        help='dataset split to evaluate on (e.g., val)')
+    parser.add_argument('--height', type=int, default=640)
+    parser.add_argument('--width', type=int, default=640)
+    parser.add_argument('--num_classes', type=int, default=133,
+                        help='number of segmentation classes')
+    parser.add_argument('--no_cuda', action='store_true')
+    parser.add_argument('--save_results', action='store_true',
+                        help='save prediction visualization')
+    return parser.parse_args()
 
 
-class SegOnlyTrainer:
-    """Trainer for single-task segmentation on COCO."""
+class COCOSemanticEvaluator:
+    """Evaluate semantic segmentation on COCO."""
 
-    def __init__(self, options):
-        self.opt = options
+    def __init__(self, num_classes=133):
+        self.num_classes = num_classes
+        self.confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
 
-        self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
+    def update(self, pred, label):
+        """Update confusion matrix."""
+        # This mask gracefully ignores index 255 (or anything outside valid classes)
+        mask = (label >= 0) & (label < self.num_classes)
 
-        assert self.opt.height % 32 == 0, "'height' must be a multiple of 32"
-        assert self.opt.width % 32 == 0, "'width' must be a multiple of 32"
+        # Flatten
+        pred = pred[mask]
+        label = label[mask]
 
-        self.models = {}
-        self.parameters_to_train =[]
+        # Update confusion matrix
+        indices = label * self.num_classes + pred
+        bincount = np.bincount(indices, minlength=self.num_classes ** 2)
+        self.confusion_matrix += bincount.reshape((self.num_classes, self.num_classes))
 
-        self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
+    def reset(self):
+        self.confusion_matrix = np.zeros((self.num_classes, self.num_classes), dtype=np.int64)
 
-        self.num_classes = options.num_classes
+    def get_iou(self):
+        """Compute IoU for each class."""
+        intersection = np.diag(self.confusion_matrix)
+        union = (self.confusion_matrix.sum(axis=1) +
+                 self.confusion_matrix.sum(axis=0) -
+                 intersection)
 
-        # SEGMENTATION-ONLY: Encoder + Segmentation decoder only
-        self.models["encoder"] = networks.LiteMono(
-            model=self.opt.model,
-            drop_path_rate=self.opt.drop_path,
-            width=self.opt.width,
-            height=self.opt.height,
-            in_chans=3
-        )
-        self.models["encoder"].to(self.device)
-        self.parameters_to_train += list(self.models["encoder"].parameters())
+        # Avoid division by zero
+        iou = intersection / (union + 1e-10)
+        return iou
 
-        self.models["segmentation"] = networks.DepthDecoder(
-            self.models["encoder"].num_ch_enc,
-            scales=[0],
-            num_output_channels=self.num_classes,
-            is_seg=True,
-            use_aspp=self.opt.use_aspp
-        )
-        self.models["segmentation"].to(self.device)
-        self.parameters_to_train += list(self.models["segmentation"].parameters())
+    def get_miou(self):
+        """Compute mean IoU."""
+        iou = self.get_iou()
+        # Exclude background class if needed, here we compute across all valid
+        return np.nanmean(iou)
 
-        self.model_optimizer = optim.AdamW(
-            self.parameters_to_train,
-            self.opt.lr,
-            weight_decay=self.opt.weight_decay
-        )
+    def get_pixel_accuracy(self):
+        """Compute pixel accuracy."""
+        correct = np.diag(self.confusion_matrix).sum()
+        total = self.confusion_matrix.sum()
+        return correct / total
 
-        self.model_lr_scheduler = optim.lr_scheduler.StepLR(
-            self.model_optimizer,
-            step_size=self.opt.scheduler_step_size,
-            gamma=0.5
-        )
+    def get_results(self):
+        """Get all metrics."""
+        iou = self.get_iou()
+        miou = self.get_miou()
+        acc = self.get_pixel_accuracy()
 
-        print("Training SEGMENTATION-ONLY baseline on COCO")
-        print("Model name:", self.opt.model_name)
-        print("Log directory:", self.log_path)
-        print("Device:", self.device)
-        print("Number of classes:", self.num_classes)
-
-        # ----------------------------------------------------
-        # DATA LOADING (Mirrors train_depth_baseline.py)
-        # ----------------------------------------------------
-        fpath = os.path.join(os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt")
-        train_filenames = readlines(fpath.format("train"))
-        val_filenames = readlines(fpath.format("val"))
-
-        num_train_samples = len(train_filenames)
-        self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
-
-        train_dataset = COCOSegmentationDataset(
-            self.opt.data_path, train_filenames, self.opt.height, self.opt.width, is_train=True)
-
-        self.train_loader = DataLoader(
-            train_dataset, self.opt.batch_size, True,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
-
-        val_dataset = COCOSegmentationDataset(
-            self.opt.data_path, val_filenames, self.opt.height, self.opt.width, is_train=False)
-
-        self.val_loader = DataLoader(
-            val_dataset, self.opt.batch_size, True,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
-        
-        self.val_iter = iter(self.val_loader)
-
-        print("Using split:\n  ", self.opt.split)
-        print("There are {:d} training items and {:d} validation items\n".format(
-            len(train_dataset), len(val_dataset)))
-
-        self.writers = {}
-        for mode in ["train", "val"]:
-            self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
-
-        self.save_opts()
-
-    def set_train(self):
-        for m in self.models.values():
-            m.train()
-
-    def set_eval(self):
-        for m in self.models.values():
-            m.eval()
-
-    def train(self):
-        self.epoch = 0
-        self.step = 0
-        self.start_time = time.time()
-
-        for self.epoch in range(self.opt.num_epochs):
-            self.run_epoch()
-            if (self.epoch + 1) % self.opt.save_frequency == 0:
-                self.save_model()
-            
-            # Full validation run at the end of every epoch for real mIoU
-            self.val_epoch()
-
-    def run_epoch(self):
-        print("Training epoch", self.epoch)
-        self.set_train()
-        self.model_lr_scheduler.step()
-
-        for batch_idx, inputs in enumerate(self.train_loader):
-            before_op_time = time.time()
-
-            outputs, losses = self.process_batch(inputs)
-
-            self.model_optimizer.zero_grad()
-            losses["loss"].backward()
-            self.model_optimizer.step()
-
-            duration = time.time() - before_op_time
-
-            # Log frequently matching the depth baseline frequency
-            early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 20000
-            late_phase = self.step % 2000 == 0
-
-            if early_phase or late_phase:
-                self.log_time(batch_idx, duration, losses["loss"].cpu().data)
-                self.log("train", inputs, outputs, losses)
-                self.val() # Quick single-batch validation to populate TensorBoard
-
-            self.step += 1
-
-    def process_batch(self, inputs):
-        """Process a batch for segmentation training."""
-        images = inputs["image"].to(self.device)  # (B, 3, H, W)
-        labels = inputs["label"].to(self.device)  # (B, H, W)
-
-        features = self.models["encoder"](images)
-        seg_outputs = self.models["segmentation"](features)
-
-        seg_logits = seg_outputs[("disp", 0)]  # (B, num_classes, H, W)
-
-        if seg_logits.shape[2:] != labels.shape[1:]:
-            seg_logits = F.interpolate(
-                seg_logits,
-                size=labels.shape[1:],
-                mode='bilinear',
-                align_corners=False
-            )
-
-        loss = F.cross_entropy(seg_logits, labels, ignore_index=255)
-
-        outputs = {
-            "seg_logits": seg_logits,
-            "seg_pred": seg_logits.argmax(dim=1)
+        return {
+            'mIoU': miou,
+            'pixel_acc': acc,
+            'per_class_iou': iou.tolist()
         }
 
-        losses = {"loss": loss}
 
-        return outputs, losses
+class PanopticEvaluator:
+    """Evaluate panoptic segmentation (PQ metric)."""
 
-    def val(self):
-        """Single batch validation logging logic mimicking train_depth_baseline.py"""
-        self.set_eval()
-        try:
-            inputs = next(self.val_iter)
-        except StopIteration:
-            self.val_iter = iter(self.val_loader)
-            inputs = next(self.val_iter)
+    # ... (Unchanged Panoptic Logic, ready for MTL Panoptic testing later)
+    def __init__(self, num_classes=133):
+        self.num_classes = num_classes
+        self.pq_stats = defaultdict(lambda: {'tp': 0, 'fp': 0, 'fn': 0, 'iou': 0.0})
 
-        with torch.no_grad():
-            outputs, losses = self.process_batch(inputs)
-            self.log("val", inputs, outputs, losses)
-            del inputs, outputs, losses
+    def pq_score(self, pred_panoptic, gt_panoptic):
+        pred_ids = np.unique(pred_panoptic)
+        gt_ids = np.unique(gt_panoptic)
+        pred_ids = pred_ids[pred_ids != 0]
+        gt_ids = gt_ids[gt_ids != 0]
 
-        self.set_train()
+        pred_masks = {pid: (pred_panoptic == pid) for pid in pred_ids}
+        gt_masks = {gid: (gt_panoptic == gid) for gid in gt_ids}
 
-    def val_epoch(self):
-        """Run full epoch validation for mIoU calculation."""
-        self.set_eval()
+        matched = set()
+        for gt_id in gt_ids:
+            gt_mask = gt_masks[gt_id]
+            gt_class = gt_id // 1000
 
-        total_loss = 0
-        total_miou = 0
-        num_batches = 0
+            best_iou = 0.5
+            best_pred = None
 
-        print(f"Running full validation for epoch {self.epoch}...")
-        with torch.no_grad():
-            for inputs in self.val_loader:
-                outputs, losses = self.process_batch(inputs)
-                total_loss += losses["loss"].item()
+            for pred_id in pred_ids:
+                if pred_id in matched: continue
+                pred_mask = pred_masks[pred_id]
+                pred_class = pred_id // 1000
 
-                pred = outputs["seg_pred"].cpu().numpy()
-                label = inputs["label"].cpu().numpy()
+                if pred_class != gt_class: continue
 
-                ious =[]
-                for cls in range(self.num_classes):
-                    if cls == 255: continue
-                    pred_mask = (pred == cls)
-                    label_mask = (label == cls)
-                    intersection = (pred_mask & label_mask).sum()
-                    union = (pred_mask | label_mask).sum()
-                    if union > 0:
-                        ious.append(intersection / union)
+                intersection = (gt_mask & pred_mask).sum()
+                union = (gt_mask | pred_mask).sum()
+                iou = intersection / (union + 1e-10)
 
-                if ious:
-                    total_miou += np.mean(ious)
-                num_batches += 1
+                if iou > best_iou:
+                    best_iou = iou
+                    best_pred = pred_id
 
-        avg_loss = total_loss / num_batches
-        avg_miou = total_miou / num_batches
+            if best_pred is not None:
+                self.pq_stats[gt_class]['tp'] += 1
+                self.pq_stats[gt_class]['iou'] += best_iou
+                matched.add(best_pred)
+            else:
+                self.pq_stats[gt_class]['fn'] += 1
 
-        print(f"Epoch {self.epoch} Validation - Loss: {avg_loss:.4f}, mIoU: {avg_miou:.4f}")
+        for pred_id in pred_ids:
+            if pred_id not in matched:
+                pred_class = pred_id // 1000
+                self.pq_stats[pred_class]['fp'] += 1
 
-        # Log Epoch metrics to tensorboard
-        self.writers["val"].add_scalar("epoch/loss", avg_loss, self.epoch)
-        self.writers["val"].add_scalar("epoch/miou", avg_miou, self.epoch)
+    def get_pq(self):
+        pq_scores = {}
+        for cls in range(1, self.num_classes):
+            stats = self.pq_stats[cls]
+            tp, fp, fn, iou = stats['tp'], stats['fp'], stats['fn'], stats['iou']
+            if tp == 0:
+                pq_scores[cls] = 0.0
+            else:
+                sq = iou / tp
+                rq = tp / (tp + 0.5 * fp + 0.5 * fn)
+                pq_scores[cls] = sq * rq
 
-        self.set_train()
-
-    def log(self, mode, inputs, outputs, losses):
-        """Log scalars and images to tensorboard."""
-        writer = self.writers[mode]
-        for l, v in losses.items():
-            writer.add_scalar(l, v, self.step)
-
-        # Log a few images per batch
-        for j in range(min(4, self.opt.batch_size)):
-            # Original RGB Image
-            writer.add_image(f"image/{j}", inputs["image"][j].data, self.step)
-
-            # Ground Truth Mask
-            gt_tensor = inputs["label"][j].unsqueeze(0).float()
-            # Ignore 255 indexing by masking it for visualization
-            gt_tensor[gt_tensor == 255] = 0 
-            # Scale to [0, 1] based on number of classes for bright visual feedback
-            gt_visual = gt_tensor / float(self.num_classes)
-            writer.add_image(f"gt_mask/{j}", gt_visual, self.step)
-
-            # Predicted Mask
-            pred_tensor = outputs["seg_pred"][j].unsqueeze(0).float()
-            pred_visual = pred_tensor / float(self.num_classes)
-            writer.add_image(f"pred_mask/{j}", pred_visual, self.step)
-
-    def log_time(self, batch_idx, duration, loss):
-        """Print a logging statement to the terminal"""
-        samples_per_sec = self.opt.batch_size / duration
-        time_sofar = time.time() - self.start_time
-        training_time_left = (self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
-        
-        print_string = "epoch {:>3} | lr {:.6f} | batch {:>6} | examples/s: {:5.1f} | loss: {:.5f} | time elapsed: {} | time left: {}"
-        print(print_string.format(
-            self.epoch, self.model_optimizer.state_dict()['param_groups'][0]['lr'],
-            batch_idx, samples_per_sec, loss,
-            sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
-
-    def save_opts(self):
-        models_dir = os.path.join(self.log_path, "models")
-        if not os.path.exists(models_dir):
-            os.makedirs(models_dir)
-        to_save = self.opt.__dict__.copy()
-        with open(os.path.join(models_dir, 'opt.json'), 'w') as f:
-            json.dump(to_save, f, indent=2)
-
-    def save_model(self):
-        save_folder = os.path.join(self.log_path, "models", "weights_{}".format(self.epoch))
-        if not os.path.exists(save_folder):
-            os.makedirs(save_folder)
-
-        for model_name, model in self.models.items():
-            save_path = os.path.join(save_folder, "{}.pth".format(model_name))
-            to_save = model.state_dict()
-            if model_name == 'encoder':
-                to_save['height'] = self.opt.height
-                to_save['width'] = self.opt.width
-            torch.save(to_save, save_path)
-        print(f"Saved model to {save_folder}")
+        avg_pq = np.mean([v for v in pq_scores.values() if v > 0])
+        return {'PQ': avg_pq, 'per_class_PQ': pq_scores}
 
 
-class SegmentationOptions:
-    def __init__(self):
-        self.data_path = "./coco"
-        self.log_dir = "./tmp"
-        self.model_name = "seg_baseline"
-        
-        # Ensures that your code reads `splits/coco/train_files.txt`
-        self.split = "coco"
-        self.dataset = "coco"
+def evaluate_coco(args):
+    """Evaluate on COCO dataset."""
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
 
-        self.model = "lite-mono-8m"
-        self.num_classes = 133 
-        self.use_aspp = True
+    print(f"Evaluating on {device}")
+    print(f"Dataset: {args.dataset}")
+    print(f"Model: {args.model}")
 
-        self.height = 640
-        self.width = 640
-        self.batch_size = 16
-        self.num_epochs = 100
-        self.lr = 1e-4
-        self.weight_decay = 1e-4
-        self.drop_path = 0.1
-        self.scheduler_step_size = 30
+    # 1. Load model
+    encoder_path = os.path.join(args.load_weights_folder, "encoder.pth")
+    seg_path = os.path.join(args.load_weights_folder, "segmentation.pth")
 
-        self.log_frequency = 100
-        self.save_frequency = 5
-        self.no_cuda = False
-        self.num_workers = 8
+    encoder_dict = torch.load(encoder_path, map_location=device)
 
-def train_seg_baseline():
-    options = SegmentationOptions()
-    import sys
-    if len(sys.argv) > 1:
-        options.model_name = sys.argv[1]
+    encoder = networks.LiteMono(
+        model=args.model,
+        height=args.height,
+        width=args.width,
+        in_chans=3
+    )
+    encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in encoder.state_dict()})
+    encoder.to(device)
+    encoder.eval()
 
-    trainer = SegOnlyTrainer(options)
-    trainer.train()
+    seg_decoder = networks.DepthDecoder(
+        encoder.num_ch_enc,
+        scales=[0],
+        num_output_channels=args.num_classes,
+        is_seg=True,
+        use_aspp=True  # As per your baseline training configuration
+    )
+    seg_decoder.load_state_dict(torch.load(seg_path, map_location=device))
+    seg_decoder.to(device)
+    seg_decoder.eval()
 
-if __name__ == "__main__":
-    train_seg_baseline()
+    # 2. Initialize evaluators
+    semantic_eval = COCOSemanticEvaluator(num_classes=args.num_classes)
+    panoptic_eval = PanopticEvaluator(num_classes=args.num_classes)
+
+    # 3. Load COCO validation dataset
+    print("Loading COCO validation set...")
+
+    # Resolves paths just like train_seg_baseline.py
+    split_path = os.path.join(os.path.dirname(__file__), "splits", args.dataset, f"{args.split}_files.txt")
+    with open(split_path, 'r') as f:
+        val_filenames = f.readlines()
+
+    val_dataset = COCOSegmentationDataset(
+        args.data_path, val_filenames, height=args.height, width=args.width, is_train=False
+    )
+
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=4)
+
+    # 4. Evaluation Loop
+    print("Running evaluation...")
+    with torch.no_grad():
+        for idx, inputs in enumerate(val_loader):
+            image = inputs['image'].to(device)
+            label = inputs['label'].numpy()
+
+            # Forward pass
+            features = encoder(image)
+            seg_out = seg_decoder(features)
+
+            logits = seg_out[("disp", 0)]
+
+            # Match Logit Size to Original Label Shape
+            if logits.shape[2:] != label.shape[1:]:
+                logits = F.interpolate(
+                    logits,
+                    size=label.shape[1:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+
+            pred = logits.argmax(dim=1).cpu().numpy()
+
+            # Update metrics (shape formatting: drop batch dim via [0])
+            semantic_eval.update(pred[0], label[0])
+
+            if (idx + 1) % 100 == 0:
+                print(f"Processed {idx + 1}/{len(val_loader)} images...")
+
+    # 5. Compute and print results
+    results = semantic_eval.get_results()
+    final_miou = results['mIoU'] * 100
+    final_acc = results['pixel_acc'] * 100
+
+    print("\n" + "=" * 60)
+    print("Segmentation Results on COCO Validation Set")
+    print("=" * 60)
+    print(f"Computed mIoU:           {final_miou:.2f}%")
+    print(f"Computed Pixel Accuracy: {final_acc:.2f}%")
+    print("=" * 60)
+
+    print("\nComparison with Published Methods:")
+    print("-" * 60)
+    print("Method              | Backbone    | mIoU (%) | PQ (%)")
+    print("-" * 60)
+    print("Panoptic-DeepLab    | R101-DC5    |   42.3   |  46.5")
+    print("Mask2Former         | R101        |   46.7   |  52.7")
+    print("Mask2Former         | Swin-L      |   51.1   |  57.0")
+    print("-" * 60)
+    print(f"Ours (Lite-Mono-8M) | Lite-Mono   |   {final_miou:.1f}   |   -- ")
+    print("=" * 60)
+
+    # (Note: PQ requires the full multi-task inference pipeline including centers)
+
+
+def main():
+    args = parse_args()
+
+    if args.dataset == 'coco':
+        evaluate_coco(args)
+    elif args.dataset == 'cityscapes':
+        print("Cityscapes evaluation not yet implemented")
+    elif args.dataset == 'kitti':
+        print("KITTI semantic evaluation not yet implemented")
+
+
+if __name__ == '__main__':
+    main()
