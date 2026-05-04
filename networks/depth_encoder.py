@@ -337,6 +337,8 @@ class LiteMono(nn.Module):
                 self.dilation = [[1, 2, 3], [1, 2, 3], [1, 2, 3, 1, 2, 3, 2, 4, 6]]
             elif height == 320 and width == 1024:
                 self.dilation = [[1, 2, 3], [1, 2, 3], [1, 2, 3, 1, 2, 3, 2, 4, 6]]
+            else:
+                self.dilation = [[1, 2, 3], [1, 2, 3],[1, 2, 3, 1, 2, 3, 2, 4, 6]]
 
         for g in global_block_type:
             assert g in ['None', 'LGFI']
