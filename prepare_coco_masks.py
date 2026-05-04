@@ -45,15 +45,15 @@ def convert_panoptic_to_semantic(json_file, img_dir, out_dir):
 if __name__ == "__main__":
     # Convert Train Masks
     convert_panoptic_to_semantic(
-        json_file='./coco/annotations/panoptic_train2017.json', 
-        img_dir='./coco/annotations/panoptic_train2017', 
-        out_dir='./coco/annotations/semantic_train2017'
+        json_file='/mnt/hdd2/home/mihaitalupascu/coco/annotations/annotations/panoptic_train2017.json', 
+        img_dir='/mnt/hdd2/home/mihaitalupascu/coco/annotations/annotations/panoptic_train2017', 
+        out_dir='/mnt/hdd2/home/mihaitalupascu/coco/annotations/annotations/semantic_train2017'
     )
     
     # Convert Val Masks
     convert_panoptic_to_semantic(
-        json_file='./coco/annotations/panoptic_val2017.json', 
-        img_dir='./coco/annotations/panoptic_val2017', 
-        out_dir='./coco/annotations/semantic_val2017'
+        json_file='/mnt/hdd2/home/mihaitalupascu/coco/annotations/annotations/panoptic_val2017.json', 
+        img_dir='/mnt/hdd2/home/mihaitalupascu/coco/annotations/annotations/panoptic_val2017', 
+        out_dir='/mnt/hdd2/home/mihaitalupascu/coco/annotations/annotations/semantic_val2017'
     )
     print("Done! Masks are ready for PyTorch.")

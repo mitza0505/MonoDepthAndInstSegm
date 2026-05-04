@@ -24,7 +24,7 @@ import torch.nn.functional as F
 import networks
 
 # Import the new dataset
-from coco_dataset import COCOSegmentationDataset
+from datasets.coco_dataset import COCOSegmentationDataset
 
 
 def time_sync():
@@ -348,12 +348,42 @@ class SegmentationOptions:
         self.no_cuda = False
         self.num_workers = 8
 
-def train_seg_baseline():
-    options = SegmentationOptions()
-    import sys
-    if len(sys.argv) > 1:
-        options.model_name = sys.argv[1]
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(description='COCO Segmentation Baseline')
+    parser.add_argument('--model_name', type=str, default='seg_baseline')
+    parser.add_argument('--data_path', type=str, required=True, help='Path to COCO dataset')
+    parser.add_argument('--log_dir', type=str, default='./tmp')
+    parser.add_argument('--split', type=str, default='coco')
+    parser.add_argument('--dataset', type=str, default='coco')
+    parser.add_argument('--model', type=str, default='lite-mono-8m')
+    parser.add_argument('--num_classes', type=int, default=133)
+    parser.add_argument('--use_aspp', action='store_true', default=True)
+    
+    # Resoluton & Training Hyperparams
+    parser.add_argument('--height', type=int, default=640)
+    parser.add_argument('--width', type=int, default=640)
+    parser.add_argument('--batch_size', type=int, default=12)
+    parser.add_argument('--num_epochs', type=int, default=50)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--drop_path', type=float, default=0.1)
+    parser.add_argument('--scheduler_step_size', type=int, default=30)
+    
+    # Utilities
+    parser.add_argument('--log_frequency', type=int, default=100)
+    parser.add_argument('--save_frequency', type=int, default=5)
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--no_cuda', action='store_true')
+    
+    # Depth specific flags (not used here but prevents crashes if passed)
+    parser.add_argument('--min_depth', type=float, default=0.1)
+    parser.add_argument('--max_depth', type=float, default=80.0)
 
+    return parser.parse_args()
+
+def train_seg_baseline():
+    options = parse_args()
     trainer = SegOnlyTrainer(options)
     trainer.train()
 
